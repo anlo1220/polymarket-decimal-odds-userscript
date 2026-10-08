@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Polymarket 多制式賠率
 // @namespace    https://polymarket.com/
-// @version      1.4.0
+// @version      1.4.1
 // @description  在 Polymarket 全站交易控制元件顯示十進位、香港盤或美式賠率。
 // @author       anlo1220
 // @match        https://polymarket.com/*
@@ -64,6 +64,15 @@
   const isSupportedPrice = (price, tagName, href) => Boolean(price
     && (price[2] !== '%' || (tagName === 'A' && isMarketHref(href))));
 
+  const matchPriceNode = (text) => {
+    const value = String(text || '').trim();
+    const plain = value.match(PRICE_NODE_PATTERN);
+    if (plain) return plain;
+    const labelled = value.replace(/^(?:buy\s+(?:yes|no)|(?:買入|买入)\s*[是否])\s*/i, '');
+    const price = labelled.match(PRICE_NODE_PATTERN);
+    return price?.[2] === '¢' ? price : null;
+  };
+
   if (typeof document === 'undefined') {
     const assert = (condition, message) => {
       if (!condition) throw new Error(message);
@@ -99,7 +108,13 @@
     assert(isSupportedPrice('58%'.match(PRICE_PATTERN), 'A', '/event/team') === true, 'market percentage');
     assert(isSupportedPrice('3.25%'.match(PRICE_PATTERN), 'A', '/rewards') === false, 'reward percentage');
     assert(isSupportedPrice('41.9¢'.match(PRICE_PATTERN), 'BUTTON', '') === true, 'cent button');
-    console.log('Polymarket odds self-check passed (30 checks).');
+    assert(matchPriceNode('Buy Yes 58.2¢')?.[1] === '58.2', 'English labelled price');
+    assert(matchPriceNode('買入 是 58.2¢')?.[1] === '58.2', 'traditional Chinese labelled price');
+    assert(matchPriceNode('买入 否 41.9¢')?.[1] === '41.9', 'simplified Chinese labelled price');
+    assert(matchPriceNode('Buy Yes 50%') === null, 'label must not bypass percent guard');
+    assert(matchPriceNode('Reward 50¢') === null, 'unrelated label');
+    assert(matchPriceNode('Buy Yes 58.2¢ US -139')?.[1] === '58.2', 'label with existing odds');
+    console.log('Polymarket odds self-check passed (36 checks).');
     return;
   }
 
@@ -108,7 +123,10 @@
   if (!document.getElementById(STYLE_ID)) {
     const style = document.createElement('style');
     style.id = STYLE_ID;
-    style.textContent = `span[${BADGE_ATTRIBUTE}] { display:block; margin:1px 0 0; opacity:.78; font-size:9px; line-height:9px; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; text-align:center; text-transform:none; pointer-events:none; }`;
+    style.textContent = `span[${BADGE_ATTRIBUTE}] { display:block; margin:1px 0 0; opacity:.78; font-size:9px; line-height:9px; font-weight:600; font-variant-numeric:tabular-nums; white-space:nowrap; text-align:center; text-transform:none; pointer-events:none; }
+      [data-pm-odds-hover] { position:relative; }
+      [data-pm-odds-hover] > span.absolute:not([${BADGE_ATTRIBUTE}]) { top:calc(50% - 4px); }
+      [data-pm-odds-hover] > span[${BADGE_ATTRIBUTE}="hover"] { position:absolute; bottom:1px; left:0; right:0; margin:0; font-size:8px; line-height:8px; overflow:hidden; text-overflow:ellipsis; }`;
     (document.head || document.documentElement).append(style);
   }
 
@@ -125,13 +143,19 @@
   const removeBadge = (source) => {
     const badge = badges.get(source);
     if (!badge) return;
+    const parent = badge.parentElement;
     badge.remove();
+    if (!parent?.querySelector(`:scope > [${BADGE_ATTRIBUTE}="hover"]`)) parent?.removeAttribute('data-pm-odds-hover');
     badgeSources.delete(badge);
     badges.delete(source);
   };
 
   const renderOdds = (source, priceText, container) => {
-    const odds = oddsFromPriceText(priceText, selectedFormat);
+    const control = source.closest(CONTROL_SELECTOR);
+    const price = matchPriceNode(priceText);
+    const supported = control && source.isConnected
+      && isSupportedPrice(price, control.tagName, control.getAttribute('href'));
+    const odds = supported ? formatOdds(price[1], selectedFormat) : null;
     let badge = badges.get(source);
 
     if (!odds) {
@@ -140,6 +164,12 @@
     }
 
     if (!container) return;
+
+    // Hover-only prices must not hide the odds with their opacity:0 container.
+    const hoverPrice = container.closest('.opacity-0');
+    const hover = hoverPrice?.parentElement === control
+      && hoverPrice.classList.contains('group-hover:opacity-100');
+    if (hover) container = control;
 
     if (!badge?.isConnected) {
       if (badge) badgeSources.delete(badge);
@@ -151,6 +181,11 @@
       badgeSources.set(badge, source);
     }
 
+    if (badge.parentElement !== container) container.append(badge);
+    const badgeMode = hover ? 'hover' : '';
+    if (badge.getAttribute(BADGE_ATTRIBUTE) !== badgeMode) badge.setAttribute(BADGE_ATTRIBUTE, badgeMode);
+    if (hover && !control.hasAttribute('data-pm-odds-hover')) control.setAttribute('data-pm-odds-hover', '');
+
     if (badge.textContent !== odds) badge.textContent = odds;
   };
 
@@ -158,20 +193,41 @@
     renderOdds(numberFlow, decodeNumberFlow(numberFlow), numberFlow.parentElement);
   };
 
+  const waitingNumberFlows = new Set();
+  let readinessTimer;
+  const waitForNumberFlow = (numberFlow) => {
+    waitingNumberFlows.add(numberFlow);
+    if (readinessTimer) return;
+    // Only unresolved components are checked; never poll or rescan the page.
+    readinessTimer = setInterval(() => {
+      waitingNumberFlows.forEach((item) => {
+        if (!item.isConnected || item.shadowRoot) {
+          waitingNumberFlows.delete(item);
+          if (item.isConnected) scheduleControl(item.closest(CONTROL_SELECTOR));
+        }
+      });
+      if (!waitingNumberFlows.size) {
+        clearInterval(readinessTimer);
+        readinessTimer = null;
+      }
+    }, 250);
+  };
+
   const updateControl = (control) => {
     const liveSources = new Set();
     const supportsPrice = (price) => isSupportedPrice(price, control.tagName, control.getAttribute('href'));
     const textPriceNodes = [...control.querySelectorAll('*')]
       .filter((node) => {
-        if (node.hasAttribute(BADGE_ATTRIBUTE) || node.closest('number-flow-react')) return false;
-        const price = node.textContent.match(PRICE_NODE_PATTERN);
+        if (node.hasAttribute(BADGE_ATTRIBUTE) || node.closest('number-flow-react')
+          || node.querySelector('number-flow-react') || node.closest(CONTROL_SELECTOR) !== control) return false;
+        const price = matchPriceNode(node.textContent);
         if (!supportsPrice(price)) return false;
         return ![...node.children].some((child) =>
-          !child.hasAttribute(BADGE_ATTRIBUTE) && PRICE_NODE_PATTERN.test(child.textContent));
+          !child.hasAttribute(BADGE_ATTRIBUTE) && matchPriceNode(child.textContent));
       });
 
-    if (!textPriceNodes.length) {
-      const price = control.textContent.match(PRICE_NODE_PATTERN);
+    if (!textPriceNodes.length && !control.querySelector(`number-flow-react, ${CONTROL_SELECTOR}`)) {
+      const price = matchPriceNode(control.textContent);
       if (supportsPrice(price)) textPriceNodes.push(control);
     }
 
@@ -181,13 +237,17 @@
     });
 
     control.querySelectorAll('number-flow-react').forEach((numberFlow) => {
+      if (numberFlow.closest(CONTROL_SELECTOR) !== control) return;
       const shadowRoot = numberFlow.shadowRoot;
       liveSources.add(numberFlow);
       updateNumberFlow(numberFlow);
 
+      if (!shadowRoot) waitForNumberFlow(numberFlow);
+      else waitingNumberFlows.delete(numberFlow);
+
       if (shadowRoot && !observedNumberFlows.has(numberFlow)) {
         observedNumberFlows.add(numberFlow);
-        new MutationObserver(() => updateNumberFlow(numberFlow)).observe(shadowRoot, {
+        new MutationObserver(() => scheduleControl(numberFlow.closest(CONTROL_SELECTOR))).observe(shadowRoot, {
           attributes: true,
           attributeFilter: ['inert'],
           childList: true,
@@ -198,6 +258,7 @@
     });
 
     control.querySelectorAll(`[${BADGE_ATTRIBUTE}]`).forEach((badge) => {
+      if (badge.closest(CONTROL_SELECTOR) !== control) return;
       const source = badgeSources.get(badge);
       if (liveSources.has(source)) return;
       if (source) removeBadge(source);
@@ -221,21 +282,28 @@
     }
   };
 
-  const scheduleNode = (node) => {
+  const scheduleNode = (node, scanDescendants = false) => {
     const element = node.nodeType === 1 ? node : node.parentElement;
     if (!element || element.closest(`[${BADGE_ATTRIBUTE}]`)) return;
     const control = element.matches(CONTROL_SELECTOR) ? element : element.closest(CONTROL_SELECTOR);
     if (control) scheduleControl(control);
-    element.querySelectorAll?.(CONTROL_SELECTOR).forEach(scheduleControl);
+    if (scanDescendants && node.nodeType === 1) element.querySelectorAll(CONTROL_SELECTOR).forEach(scheduleControl);
   };
 
-  Object.entries(FORMAT_LABELS).forEach(([format, label]) => {
-    GM_registerMenuCommand(`賠率格式：${label}`, () => {
-      selectedFormat = format;
-      GM_setValue(FORMAT_KEY, format);
-      document.querySelectorAll(CONTROL_SELECTOR).forEach(updateControl);
+  const menuIds = new Map();
+  const updateMenus = () => {
+    Object.entries(FORMAT_LABELS).forEach(([format, label]) => {
+      const name = `${selectedFormat === format ? '✓ ' : ''}賠率格式：${label}`;
+      const id = GM_registerMenuCommand(name, () => {
+        selectedFormat = format;
+        GM_setValue(FORMAT_KEY, format);
+        document.querySelectorAll(CONTROL_SELECTOR).forEach(updateControl);
+        updateMenus();
+      }, { id: menuIds.get(format) });
+      menuIds.set(format, id);
     });
-  });
+  };
+  updateMenus();
 
   document.querySelectorAll(CONTROL_SELECTOR).forEach(updateControl);
   new MutationObserver((mutations) => {
@@ -244,7 +312,7 @@
       if (mutation.type === 'childList' && changedNodes.length
         && changedNodes.every((node) => node.nodeType === 1 && node.hasAttribute(BADGE_ATTRIBUTE))) return;
       scheduleNode(mutation.target);
-      mutation.addedNodes.forEach(scheduleNode);
+      mutation.addedNodes.forEach((node) => scheduleNode(node, true));
     });
   }).observe(document.body, {
     attributes: true,
